@@ -1,0 +1,193 @@
+# =====================================================================
+#  transaction-pipeline - full local infrastructure
+#
+#  Start:    docker compose up -d
+#  Status:   docker compose ps
+#  Stop:     docker compose down          (data survives)
+#  Wipe:     docker compose down -v       (data is destroyed!)
+# =====================================================================
+
+name: transaction-pipeline
+
+# ---------------------------------------------------------------------
+# Shared configuration for the three Airflow containers.
+# "&airflow-common" is a YAML anchor: it defines the block once,
+# and "<<: *airflow-common" pastes it in elsewhere.
+# ---------------------------------------------------------------------
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.11.0
+  user: "${AIRFLOW_UID:-50000}:0"
+  environment:
+    # LocalExecutor = tasks run as processes on this same machine.
+    # Enough here; CeleryExecutor/KubernetesExecutor scale across hosts.
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    # Airflow's own database - its notebook, NOT our warehouse
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@airflow-db:5432/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    # Connection to OUR warehouse, used by the DAG.
+    # Airflow turns any AIRFLOW_CONN_<ID> variable into a Connection.
+    AIRFLOW_CONN_TRANSACTIONS_DB: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    # UI account - only airflow-init uses these, on first startup
+    AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER}
+    AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+  volumes:
+    - ./dags:/opt/airflow/dags     # our DAGs, live-mounted into the container
+    - ./logs:/opt/airflow/logs     # task logs readable from the host
+  depends_on:
+    airflow-db:
+      condition: service_healthy
+
+services:
+
+  # -------------------------------------------------------------------
+  # KAFKA - the broker: a log of messages, not a queue.
+  #
+  # KRaft mode: Kafka manages its own metadata, no ZooKeeper needed.
+  # This single container plays two roles at once:
+  #   broker     - accepts and serves messages
+  #   controller - owns the metadata (partition leaders, topic list)
+  # A real cluster splits these roles across separate machines.
+  # -------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.9.2
+    container_name: tp-kafka
+    ports:
+      - "29092:29092"          # entrance FROM THE HOST (localhost:29092)
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+
+      # --- THREE ENTRANCES ---
+      # INTERNAL   : for containers on the Docker network -> kafka:9092
+      # EXTERNAL   : for programs on the host machine     -> localhost:29092
+      # CONTROLLER : Kafka talking to itself about metadata
+      #              (this is the job ZooKeeper used to do)
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # "1@kafka:9093" = the only voter in the quorum is node 1 at that address
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+
+      # Single broker, so there is nowhere to keep replicas -> factor 1.
+      # Production would use 3, so data survives losing one machine.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Without this the first consumer waits 3s for others to join
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  # -------------------------------------------------------------------
+  # POSTGRES - our warehouse: raw + reporting layers.
+  # This one gets a volume because it is the system of record.
+  # Kafka does not, because it only transports data.
+  # -------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: tp-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"            # so you can connect from the host (psql, DBeaver)
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Scripts in ./sql run AUTOMATICALLY, but only when the database
+      # is created empty. Changing them later requires: docker compose down -v
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # -------------------------------------------------------------------
+  # AIRFLOW-DB - separate database for Airflow's internal state
+  # (run history, UI accounts). Kept apart from the warehouse on purpose.
+  # No "ports" section: unreachable from outside the Docker network.
+  # -------------------------------------------------------------------
+  airflow-db:
+    image: postgres:16-alpine
+    container_name: tp-airflow-db
+    environment:
+      POSTGRES_USER: ${AIRFLOW_DB_USER}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AIRFLOW_DB_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # -------------------------------------------------------------------
+  # AIRFLOW-INIT - one-shot container: creates Airflow's tables and the
+  # UI account, then exits. "Exited (0)" here means success, not failure.
+  # -------------------------------------------------------------------
+  airflow-init:
+    <<: *airflow-common
+    container_name: tp-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --role Admin \
+          --username "$${AIRFLOW_ADMIN_USER}" \
+          --password "$${AIRFLOW_ADMIN_PASSWORD}" \
+          --firstname Admin --lastname User \
+          --email admin@example.com || true
+    restart: "no"
+
+  # -------------------------------------------------------------------
+  # AIRFLOW-WEBSERVER - the UI at http://localhost:8080.
+  # This is the shop window. Losing it does not stop any processing.
+  # -------------------------------------------------------------------
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: tp-airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------
+  # AIRFLOW-SCHEDULER - the heart of the batch layer: watches the clock
+  # and triggers DAG runs. This is the one that must never be down.
+  # -------------------------------------------------------------------
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: tp-airflow-scheduler
+    command: scheduler
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+# ---------------------------------------------------------------------
+# Volumes = container disks that outlive the container itself.
+# Without them every "docker compose down" would wipe the database.
+# ---------------------------------------------------------------------
+volumes:
+  postgres-data:
+  airflow-db-data:
