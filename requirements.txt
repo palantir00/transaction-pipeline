@@ -1,0 +1,15 @@
+# ---- warstwa strumieniowa (producer + consumer) ----
+kafka-python==3.0.11
+
+# ---- baza danych ----
+psycopg2-binary==2.9.12
+
+# ---- konfiguracja z pliku .env ----
+python-dotenv==1.2.3
+
+# ---- testy ----
+pytest==9.1.1
+
+# UWAGA: apache-airflow celowo NIE jest tutaj.
+# Airflow dostajemy z gotowego obrazu Dockera (Etap 1) - instalacja przez pip
+# ciagnie ~100 zaleznosci i lubi sie klocic o wersje.
