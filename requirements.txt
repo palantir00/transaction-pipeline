@@ -1,15 +1,16 @@
-# ---- warstwa strumieniowa (producer + consumer) ----
+# ---- streaming layer (producer + consumer) ----
 kafka-python==3.0.11
 
-# ---- baza danych ----
+# ---- database ----
 psycopg2-binary==2.9.12
 
-# ---- konfiguracja z pliku .env ----
+# ---- configuration from .env ----
 python-dotenv==1.2.3
 
-# ---- testy ----
+# ---- tests ----
 pytest==9.1.1
 
-# UWAGA: apache-airflow celowo NIE jest tutaj.
-# Airflow dostajemy z gotowego obrazu Dockera (Etap 1) - instalacja przez pip
-# ciagnie ~100 zaleznosci i lubi sie klocic o wersje.
+# NOTE: apache-airflow is deliberately absent.
+# Airflow comes from a prebuilt Docker image (see docker-compose.yml).
+# Installing it via pip pulls in ~100 dependencies and tends to
+# conflict with everything else in this file.
